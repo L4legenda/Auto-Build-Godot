@@ -1,0 +1,245 @@
+name: Build and Release Android APK + Windows
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  GODOT_VERSION: "4.4.1"
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  KEYSTORE_PATH: "$GITHUB_WORKSPACE/android.keystore"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Debug Environment
+      run: |
+        echo "=== ENVIRONMENT DEBUG ==="
+        echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+        echo "GODOT_VERSION: ${{ env.GODOT_VERSION }}"
+        echo "ANDROID_HOME: ${{ env.ANDROID_HOME }}"
+        echo "KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}"
+        echo "========================="
+
+    - name: Get version from tag
+      id: get_version
+      run: |
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "Current tag: $latest_tag"
+        
+        if [[ $latest_tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+          major=${BASH_REMATCH[1]}
+          minor=${BASH_REMATCH[2]}
+          patch=${BASH_REMATCH[3]}
+          new_patch=$((patch + 1))
+          new_tag="v$major.$minor.$new_patch"
+        else
+          new_tag="v1.0.0"
+        fi
+        
+        echo "New tag: $new_tag"
+        echo "tag_name=$new_tag" >> $GITHUB_OUTPUT
+        echo "release_name=Release $new_tag" >> $GITHUB_OUTPUT
+
+    - name: Setup Java JDK 17
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-17-jdk
+        echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+        echo "Java version:"
+        java -version
+
+    - name: Install Godot and Templates
+      run: |
+        echo "=== INSTALLING GODOT ${{ env.GODOT_VERSION }} ==="
+        wget https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
+        unzip Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip
+        sudo mv Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64 /usr/local/bin/godot
+        sudo chmod +x /usr/local/bin/godot
+        
+        echo "Godot version:"
+        godot --version
+        
+        echo "=== INSTALLING EXPORT TEMPLATES ==="
+        TEMPLATES_URL="https://github.com/godotengine/godot-builds/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz"
+        wget $TEMPLATES_URL -O templates.tpz
+        mkdir -p ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable
+        unzip templates.tpz -d ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable
+        mv ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable/templates/* ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable/
+        rmdir ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable/templates
+        
+        echo "=== TEMPLATES INSTALLED ==="
+        ls -la ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable/
+
+    - name: Install Android SDK
+      run: |
+        echo "=== INSTALLING ANDROID SDK ==="
+        mkdir -p $ANDROID_HOME
+        wget https://dl.google.com/android/repository/commandlinetools-linux-10406996_latest.zip -O cmdline-tools.zip
+        unzip cmdline-tools.zip -d cmdline-tools
+        mv cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+        echo "$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+        
+        mkdir -p $ANDROID_HOME/licenses
+        echo -e "8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e" > $ANDROID_HOME/licenses/android-sdk-license
+        
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --verbose \
+          "platform-tools" \
+          "platforms;android-33" \
+          "build-tools;34.0.0" \
+          "ndk;25.2.9519653"
+        
+        echo "=== ANDROID SDK TOOLS ==="
+        $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list
+
+    - name: Setup Android Keystore
+      run: |
+        echo "=== SETTING UP KEYSTORE ==="
+        if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+          echo "::warning::No keystore provided, generating temporary one..."
+          keytool -genkeypair \
+            -v \
+            -keystore ${{ env.KEYSTORE_PATH }} \
+            -alias androidkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=, OU=, O=, L=, S=, C="
+        else
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > ${{ env.KEYSTORE_PATH }}
+        fi
+        
+        echo "=== KEYSTORE INFO ==="
+        ls -la ${{ env.KEYSTORE_PATH }}
+        keytool -list -v -keystore ${{ env.KEYSTORE_PATH }} -storepass android 2>/dev/null || true
+
+    - name: Verify Keystore
+      run: |
+        echo "=== VERIFYING KEYSTORE ==="
+        if [ ! -f ${{ env.KEYSTORE_PATH }} ]; then
+          echo "::error::Keystore file not found at ${{ env.KEYSTORE_PATH }}!"
+          exit 1
+        fi
+        
+        echo "Keystore contents:"
+        keytool -list -v -keystore ${{ env.KEYSTORE_PATH }} -storepass ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }} || \
+        (echo "::error::Keystore verification failed!" && exit 1)
+        
+        echo "Keystore is valid and accessible"
+
+    - name: Export Android APK (Release)
+      env:
+        KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
+        KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'androidkey' }}
+        KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
+      run: |
+        echo "=== PREPARING EXPORT CONFIG ==="
+        cat > export_presets.cfg <<EOL
+        [preset.0]
+        
+        name="Android"
+        platform="Android"
+        runnable=true
+        custom_features=""
+        export_path="build/android/output.apk"
+        export_filter="all_resources"
+        include_filter=""
+        exclude_filter=""
+        
+        [preset.0.options]
+        
+        keystore/release="${{ env.KEYSTORE_PATH }}"
+        keystore/release_user="$KEY_ALIAS"
+        keystore/release_password="$KEY_PASSWORD"
+        EOL
+
+        echo "=== EXPORT PRESETS ==="
+        cat export_presets.cfg
+        echo "======================"
+
+        echo "=== FILE STRUCTURE ==="
+        ls -la
+        echo "======================"
+
+        echo "=== STARTING GODOT EXPORT ==="
+        mkdir -p build/android
+        godot --headless --path ./ --verbose --export-release "Android" build/android/output.apk
+
+        echo "=== EXPORT RESULTS ==="
+        if [ -f build/android/output.apk ]; then
+          echo "::notice::APK successfully created!"
+          ls -la build/android/
+          apksigner verify --verbose build/android/output.apk || echo "::warning::APK verification failed (may be expected for debug builds)"
+        else
+          echo "::error::APK file was not created!"
+          exit 1
+        fi
+
+    - name: Export Windows EXE (Release)
+      run: |
+        echo "=== PREPARING WINDOWS EXPORT ==="
+        cat > export_presets.cfg <<EOL
+        [preset.0]
+        
+        name="Windows"
+        platform="Windows Desktop"
+        runnable=true
+        custom_features=""
+        export_path="build/windows/game.exe"
+        export_filter="all_resources"
+        include_filter=""
+        exclude_filter=""
+        
+        [preset.0.options]
+        EOL
+
+        echo "=== STARTING WINDOWS EXPORT ==="
+        mkdir -p build/windows
+        godot --headless --path ./ --verbose --export-release "Windows" build/windows/game.exe
+
+        echo "=== WINDOWS EXPORT RESULTS ==="
+        if [ -f build/windows/game.exe ]; then
+          echo "::notice::Windows EXE successfully created!"
+          ls -la build/windows/
+        else
+          echo "::error::Windows EXE file was not created!"
+          exit 1
+        fi
+
+        echo "=== CREATING WINDOWS ZIP ==="
+        cd build/windows
+        zip -r ../windows_build.zip .
+        cd ../..
+        ls -la build/
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          build/android/output.apk
+          build/windows_build.zip
+        retention-days: 1
+
+    - name: Create or Update Release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ github.event_name == 'release' && github.event.tag_name || steps.get_version.outputs.tag_name }}
+        name: ${{ github.event_name == 'release' && github.event.release.name || steps.get_version.outputs.release_name }}
+        artifacts: "build/android/output.apk, build/windows_build.zip"
+        token: ${{ secrets.GITHUB_TOKEN }}
